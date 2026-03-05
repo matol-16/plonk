@@ -1,0 +1,245 @@
+
+import matplotlib.pyplot as plt
+from matplotlib import colormaps
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from torchvision import transforms
+import torch
+from PIL import Image
+import numpy as np
+
+
+def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_perturbed, perturb_budget = None, cfg=None):
+    plt.figure(figsize=(8,6))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_global()
+    ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
+
+    # Higher-contrast map colors for better point visibility
+    ax.set_facecolor('#1f2a38')
+    ax.add_feature(cfeature.OCEAN, facecolor='#1f2a38')
+    ax.add_feature(cfeature.LAND, facecolor='#d9d2b6', edgecolor='none')
+    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=0.7)
+    ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='white', linewidth=0.6)
+
+    # Pipeline outputs arrays shaped [N, 2] as [latitude, longitude]
+    ax.scatter(
+        gps_coords_source[:, 1],
+        gps_coords_source[:, 0],
+        color='deepskyblue',
+        marker='o',
+        s=200,
+        alpha=0.95,
+        linewidths=0.5,
+        transform=ccrs.PlateCarree(),
+        label='Source Locations',
+        zorder=5,
+    )
+    if gps_coords_target is not None and len(gps_coords_target) > 0:
+        ax.scatter(
+            gps_coords_target[:, 1],
+            gps_coords_target[:, 0],
+            color='lime',
+            marker='o',
+            s=200,
+            alpha=0.95,
+            linewidths=0.5,
+            transform=ccrs.PlateCarree(),
+            label='Target Locations',
+            zorder=6,
+        )
+    ax.scatter(
+        gps_coords_perturbed[:, 1],
+        gps_coords_perturbed[:, 0],
+        color='red',
+        marker='X',
+        s=100,
+        alpha=0.95,
+        edgecolors='white',
+        linewidths=0.8,
+        transform=ccrs.PlateCarree(),
+        label='Perturbed Predicted Locations',
+        zorder=7,
+    )
+
+    # Add gridlines
+    gl = ax.gridlines(draw_labels=True, linewidth=0.45, color='white', alpha=0.25, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+
+    # Add title and legend
+    title = 'Geolocation Samples (Global View)' if perturb_budget is None else f'Geolocation Samples (Budget: {perturb_budget:.3f})'
+    
+    if cfg is not None:
+        title += f", CFG: {cfg}"
+    
+    plt.title(title, fontsize=16, color='black', pad=20)
+    plt.legend(loc='upper left', fontsize='large', frameon=True, facecolor='white', edgecolor='black')
+
+    plt.tight_layout()
+    plt.show()
+    
+    
+
+def plot_gps_trajectories_on_map(
+    gps_traj_source,
+    gps_traj_perturbed,
+    perturb_budget=None,
+    cfg=None,
+    max_trajectories=16,
+    show_paths=True,
+    show_connectors=True,
+    show_displacement=True,
+    point_size=8,
+):
+    fig = plt.figure(figsize=(12, 5) if show_displacement else (8, 6))
+    ax = fig.add_subplot(1, 2, 1, projection=ccrs.PlateCarree()) if show_displacement else fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    ax.set_global()
+    ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
+
+    # Higher-contrast map colors for better point visibility
+    ax.set_facecolor('#1f2a38')
+    ax.add_feature(cfeature.OCEAN, facecolor='#1f2a38')
+    ax.add_feature(cfeature.LAND, facecolor='#d9d2b6', edgecolor='none')
+    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=0.7)
+    ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='white', linewidth=0.6)
+
+    if isinstance(gps_traj_source, torch.Tensor):
+        gps_traj_source = gps_traj_source.detach().cpu().numpy()
+    if isinstance(gps_traj_perturbed, torch.Tensor):
+        gps_traj_perturbed = gps_traj_perturbed.detach().cpu().numpy()
+
+    gps_traj_source = np.asarray(gps_traj_source)
+    gps_traj_perturbed = np.asarray(gps_traj_perturbed)
+
+    if gps_traj_source.ndim != 3 or gps_traj_source.shape[-1] != 2:
+        raise ValueError("gps_traj_source must have shape [num_steps, batch_size, 2]")
+    if gps_traj_perturbed.ndim != 3 or gps_traj_perturbed.shape[-1] != 2:
+        raise ValueError("gps_traj_perturbed must have shape [num_steps, batch_size, 2]")
+    if gps_traj_perturbed.shape[1] != gps_traj_source.shape[1]:
+        raise ValueError("gps_traj_source and gps_traj_perturbed must have the same batch_size")
+
+    num_steps, batch_size, _ = gps_traj_source.shape
+    n_plot = min(batch_size, max_trajectories)
+    colors = colormaps['tab20'](np.linspace(0, 1, max(n_plot, 2)))
+
+    for trajectory_index in range(n_plot):
+        c = colors[trajectory_index % len(colors)]
+
+        source_traj = gps_traj_source[:, trajectory_index, :]  # [num_steps, 2]
+        if show_paths:
+            ax.plot(source_traj[:, 1], source_traj[:, 0], color=c, linewidth=0.7, alpha=0.35, transform=ccrs.PlateCarree(), zorder=4)
+        ax.scatter(
+            source_traj[:, 1],
+            source_traj[:, 0],
+            color=c,
+            marker='o',
+            s=point_size,
+            alpha=0.85,
+            linewidths=0,
+            transform=ccrs.PlateCarree(),
+            zorder=5,
+            label='Source trajectories' if trajectory_index == 0 else None,
+        )
+
+        perturbed_traj = gps_traj_perturbed[:, trajectory_index, :]  # [num_steps, 2]
+        if show_paths:
+            ax.plot(perturbed_traj[:, 1], perturbed_traj[:, 0], color=c, linewidth=0.7, alpha=0.35, linestyle='--', transform=ccrs.PlateCarree(), zorder=4)
+        ax.scatter(
+            perturbed_traj[:, 1],
+            perturbed_traj[:, 0],
+            color=c,
+            marker='x',
+            s=point_size,
+            alpha=0.85,
+            linewidths=0.8,
+            transform=ccrs.PlateCarree(),
+            zorder=6,
+            label='Perturbed trajectories' if trajectory_index == 0 else None,
+        )
+
+        if show_connectors:
+            for step_index in range(num_steps):
+                ax.plot(
+                    [source_traj[step_index, 1], perturbed_traj[step_index, 1]],
+                    [source_traj[step_index, 0], perturbed_traj[step_index, 0]],
+                    color=c,
+                    linewidth=0.4,
+                    alpha=0.2,
+                    transform=ccrs.PlateCarree(),
+                    zorder=3,
+                )
+
+    # Add gridlines
+    gl = ax.gridlines(draw_labels=True, linewidth=0.45, color='white', alpha=0.25, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+
+    # Add title and legend
+    title = 'Geolocation Trajectories (Global View)' if perturb_budget is None else f'Geolocation Trajectories (Budget: {perturb_budget:.3f})'
+    
+    if cfg is not None:
+        title += f", CFG: {cfg}"
+    if n_plot < batch_size:
+        title += f" (showing {n_plot}/{batch_size})"
+    
+    ax.set_title(title, fontsize=13, color='black', pad=12)
+    ax.legend(loc='upper left', fontsize='small', frameon=True, facecolor='white', edgecolor='black')
+
+    if show_displacement:
+        ax_disp = fig.add_subplot(1, 2, 2)
+        dlat = gps_traj_perturbed[:, :n_plot, 0] - gps_traj_source[:, :n_plot, 0]
+        dlon = gps_traj_perturbed[:, :n_plot, 1] - gps_traj_source[:, :n_plot, 1]
+        displacement = np.sqrt(dlat ** 2 + dlon ** 2)
+        mean_disp = displacement.mean(axis=1)
+        std_disp = displacement.std(axis=1)
+        steps = np.arange(num_steps)
+        ax_disp.plot(steps, mean_disp, color='crimson', linewidth=1.8, label='Mean displacement')
+        ax_disp.fill_between(steps, np.maximum(mean_disp - std_disp, 0), mean_disp + std_disp, color='crimson', alpha=0.2, label='±1 std')
+        ax_disp.set_title('Perturbation effect over steps', fontsize=12)
+        ax_disp.set_xlabel('Step')
+        ax_disp.set_ylabel('Displacement (deg)')
+        ax_disp.grid(alpha=0.3)
+        ax_disp.legend(fontsize='small')
+
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_gps_trajectories_clean(gps_traj_source, gps_traj_perturbed, perturb_budget=None, cfg=None):
+    return plot_gps_trajectories_on_map(
+        gps_traj_source=gps_traj_source,
+        gps_traj_perturbed=gps_traj_perturbed,
+        perturb_budget=perturb_budget,
+        cfg=cfg,
+        max_trajectories=12,
+        show_paths=True,
+        show_connectors=False,
+        show_displacement=True,
+        point_size=6,
+    )
+    
+    
+
+def add_perturbation_to_image(image: Image, perturbation: torch.Tensor, pipeline):
+    # Convert the image to a tensor
+    image_tensor = pipeline.cond_preprocessing.augmentation(image).unsqueeze(0).to(perturbation.device)
+    # Add the perturbation to the image tensor
+    perturbed_tensor = image_tensor + perturbation
+
+    # Convert the perturbed tensor back to an image. cond_prepocesser has no deprocess method, so we need to implement it ourselves. We just need to unnormalize the image and convert it back to PIL format.
+    perturbed_image = tensor_to_pil(perturbed_tensor.squeeze(0))
+
+    return perturbed_image
+
+def tensor_to_pil(tensor: torch.Tensor):
+    # Unnormalize the tensor (assuming it was normalized with mean=[0.5, 0.5, 0.5] and std=[0.5, 0.5, 0.5])
+    unnormalize = transforms.Normalize(
+        mean=[-0.5 / 0.5, -0.5 / 0.5, -0.5 / 0.5],
+        std=[1 / 0.5, 1 / 0.5, 1 / 0.5]
+    )
+    unnormalized_tensor = unnormalize(tensor.squeeze(0)).clamp(0, 1)
+
+    # Convert to PIL image
+    pil_image = transforms.ToPILImage()(unnormalized_tensor.cpu())
+    return pil_image
