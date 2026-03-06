@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import tqdm as tqdm
 import numpy as np
+from itertools import product
 
 ############################################################################################
 # Attempt 1 training pipeline: universal perturbation on a single source image
@@ -43,7 +44,7 @@ def train_diffusion_perturbation(
     n_steps=400,
     train_batch_size=64,
     lr=2e-2,
-    eps_max=1,
+    eps_max=1.0,
     anchor_samples=256,
     clean_num_steps=200,
     log_every=20,
@@ -64,7 +65,9 @@ def train_diffusion_perturbation(
 
     # Universal perturbation parameter
     delta = torch.zeros_like(source_tensor, requires_grad=True)
-    optimizer = torch.optim.Adam([delta], lr=lr)
+    # optimizer = torch.optim.Adam([delta], lr=lr)
+    #we use sign sgd
+    optimizer = torch.optim.SGD([delta], lr=lr)
 
     # Approximate x0 distribution for this source image
     x0_bank = build_x0_bank_from_clean_model(
@@ -132,11 +135,14 @@ def train_diffusion_perturbation(
 
 
         loss.backward()
-        optimizer.step()
-
-        # Project onto l_inf ball (PGD)
+        
+        #perform sign sgd in the l inf ball of radius eps_max:
         with torch.no_grad():
-            delta.clamp_(-eps_max, eps_max)
+            delta.grad = torch.sign(delta.grad)
+            optimizer.step()
+            delta.data = torch.clamp(delta.data, -eps_max, eps_max)
+            delta.grad.zero_()
+        
 
         history.append(loss.item())
         if (step + 1) % log_every == 0:
@@ -245,31 +251,179 @@ class PlonkPipelineTrajectory(PlonkPipeline):
                     return_trajectories=return_trajectories,
                 )
 
-        # Apply postprocessing and return
+        # Apply postprocessing to final samples
         output = self.postprocessing(output)
-        # To degrees
         output = np.degrees(output.detach().cpu().numpy())
         
-        #apply postprocessing to trajectories if they are returned. This must be done for each step
+        # Apply postprocessing to each trajectory step if requested.
+        # Keep the same conversion path as `output`: cartesian -> radians -> degrees.
         if traj is not None:
-            traj_gps = np.zeros((len(traj), batch_size, 2))
-            for i_batch_traj, batch_traj in enumerate(traj):
+            if isinstance(traj, torch.Tensor):
+                traj_steps = [traj[i] for i in range(traj.shape[0])]
+            else:
+                traj_steps = list(traj)
+
+            traj_gps = []
+            for batch_traj in traj_steps:
+                if not isinstance(batch_traj, torch.Tensor):
+                    batch_traj = torch.as_tensor(batch_traj, device=self.device)
                 batch_traj_gps = self.postprocessing(batch_traj)
                 batch_traj_gps = np.degrees(batch_traj_gps.detach().cpu().numpy())
-                traj_gps[i_batch_traj] = batch_traj_gps
-            traj = traj_gps
+                traj_gps.append(batch_traj_gps)
+            traj = np.stack(traj_gps, axis=0)
         
         if return_trajectories and traj is not None:
-            if isinstance(traj, (list, tuple)):
-                traj = torch.stack([
-                    t.detach().to("cpu") if isinstance(t, torch.Tensor) else torch.as_tensor(t)
-                    for t in traj
-                ])
-            elif isinstance(traj, torch.Tensor):
-                traj = traj.detach().to("cpu")
-            else:
-                traj = torch.as_tensor(traj)
-            traj = np.degrees(traj.numpy())
             return output, traj
         else:
             return output
+
+
+def build_diffusion_hparam_grid(
+    lrs,
+    train_batch_sizes,
+    anchor_samples_list,
+    clean_num_steps_list,
+    eps_max_list=None,
+):
+    """
+    Build cartesian-product hyperparameter configurations for diffusion attack training.
+
+    Returns a list of dicts with keys:
+      - lr
+      - train_batch_size
+      - anchor_samples
+      - clean_num_steps
+      - eps_max (optional; included when eps_max_list is provided)
+    """
+    if eps_max_list is None:
+        eps_max_list = [None]
+
+    grid = []
+    for lr, train_batch_size, anchor_samples, clean_num_steps, eps_max_value in product(
+        lrs,
+        train_batch_sizes,
+        anchor_samples_list,
+        clean_num_steps_list,
+        eps_max_list,
+    ):
+        if lr is None or train_batch_size is None or anchor_samples is None or clean_num_steps is None:
+            raise ValueError("lrs, train_batch_sizes, anchor_samples_list and clean_num_steps_list cannot contain None")
+        config = {
+            "lr": float(lr),
+            "train_batch_size": int(train_batch_size),
+            "anchor_samples": int(anchor_samples),
+            "clean_num_steps": int(clean_num_steps),
+        }
+        if eps_max_value is not None:
+            config["eps_max"] = float(eps_max_value)
+        grid.append(config)
+    return grid
+
+
+def _score_history(history, tail_k=25):
+    """Lower is better: mean of the last k losses (or all if shorter)."""
+    if len(history) == 0:
+        return float("inf")
+    k = min(int(tail_k), len(history))
+    return float(np.mean(history[-k:]))
+
+
+def run_diffusion_hparam_search(
+    source_image,
+    pipeline,
+    hparam_grid,
+    n_steps=400,
+    eps_max=1,
+    target_pure_noise=False,
+    reconstruction_loss_weight=0,
+    device="cuda",
+    log_every=20,
+    score_tail_k=25,
+    keep_deltas=False,
+    show_progress=True,
+):
+    """
+    Run a hyperparameter search over `train_diffusion_perturbation`.
+
+    Args:
+        source_image: PIL image used for training.
+        pipeline: PLONK pipeline.
+        hparam_grid: iterable of dicts with keys
+            {"lr", "train_batch_size", "anchor_samples", "clean_num_steps"}
+            and optionally "eps_max".
+        n_steps, eps_max, target_pure_noise, reconstruction_loss_weight, device, log_every:
+            forwarded to train_diffusion_perturbation.
+        score_tail_k: score = mean of the last k training losses.
+        keep_deltas: if True, each trial stores trained perturbation tensor.
+        show_progress: tqdm over trials.
+
+    Returns:
+        dict with keys:
+          - best_index
+          - best_config
+          - best_score
+          - trials (list of per-trial dicts)
+            each trial has: config, score, final_loss, min_loss, history, (optional) delta
+    """
+    trials = []
+    best_index = None
+    best_score = float("inf")
+
+    iterator = enumerate(hparam_grid)
+    if show_progress:
+        iterator = tqdm.tqdm(iterator, total=len(hparam_grid), desc="Hyperparameter search")
+
+    for trial_index, config in iterator:
+        required = {"lr", "train_batch_size", "anchor_samples", "clean_num_steps"}
+        missing = required.difference(config.keys())
+        if missing:
+            raise ValueError(f"Missing keys in config {trial_index}: {sorted(missing)}")
+
+        trial_eps_max = float(config["eps_max"]) if "eps_max" in config else float(eps_max)
+
+        delta, history, _ = train_diffusion_perturbation(
+            source_image=source_image,
+            pipeline=pipeline,
+            n_steps=n_steps,
+            train_batch_size=int(config["train_batch_size"]),
+            lr=float(config["lr"]),
+            eps_max=trial_eps_max,
+            anchor_samples=int(config["anchor_samples"]),
+            clean_num_steps=int(config["clean_num_steps"]),
+            log_every=log_every,
+            target_pure_noise=target_pure_noise,
+            reconstruction_loss_weight=reconstruction_loss_weight,
+            device=device,
+        )
+
+        score = _score_history(history, tail_k=score_tail_k)
+        trial = {
+            "config": {
+                "lr": float(config["lr"]),
+                "train_batch_size": int(config["train_batch_size"]),
+                "anchor_samples": int(config["anchor_samples"]),
+                "clean_num_steps": int(config["clean_num_steps"]),
+            },
+            "score": score,
+            "final_loss": float(history[-1]) if len(history) > 0 else float("inf"),
+            "min_loss": float(np.min(history)) if len(history) > 0 else float("inf"),
+            "history": history,
+        }
+        if "eps_max" in config:
+            trial["config"]["eps_max"] = trial_eps_max
+        if keep_deltas:
+            trial["delta"] = delta
+
+        trials.append(trial)
+
+        if score < best_score:
+            best_score = score
+            best_index = trial_index
+
+    best_config = trials[best_index]["config"] if best_index is not None else None
+    return {
+        "best_index": best_index,
+        "best_config": best_config,
+        "best_score": best_score,
+        "trials": trials,
+    }

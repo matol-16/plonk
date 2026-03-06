@@ -9,6 +9,43 @@ from PIL import Image
 import numpy as np
 
 
+def _sanitize_lon_lat(coords):
+    """Return valid [lat, lon] rows only, wrapping lon to [-180, 180]."""
+    arr = np.asarray(coords, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError("Expected coords shape [N, 2] with [lat, lon]")
+
+    arr = arr.copy()
+    arr[:, 1] = ((arr[:, 1] + 180.0) % 360.0) - 180.0
+    arr[:, 0] = np.clip(arr[:, 0], -90.0, 90.0)
+
+    valid = np.isfinite(arr).all(axis=1)
+    return arr[valid], valid
+
+
+def _plot_valid_path(ax, lat_lon_traj, **plot_kwargs):
+    """Plot only contiguous valid trajectory segments to avoid Shapely warnings."""
+    traj = np.asarray(lat_lon_traj, dtype=np.float64)
+    if traj.ndim != 2 or traj.shape[1] != 2:
+        return
+
+    traj = traj.copy()
+    traj[:, 1] = ((traj[:, 1] + 180.0) % 360.0) - 180.0
+    traj[:, 0] = np.clip(traj[:, 0], -90.0, 90.0)
+    valid = np.isfinite(traj).all(axis=1)
+
+    start = None
+    for i, is_valid in enumerate(valid):
+        if is_valid and start is None:
+            start = i
+        if (not is_valid or i == len(valid) - 1) and start is not None:
+            end = i if not is_valid else i + 1
+            if end - start >= 2:
+                seg = traj[start:end]
+                ax.plot(seg[:, 1], seg[:, 0], **plot_kwargs)
+            start = None
+
+
 def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_perturbed, perturb_budget = None, cfg=None):
     plt.figure(figsize=(8,6))
     ax = plt.axes(projection=ccrs.PlateCarree())
@@ -22,19 +59,25 @@ def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_per
     ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=0.7)
     ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='white', linewidth=0.6)
 
+    gps_coords_source, _ = _sanitize_lon_lat(gps_coords_source)
+    gps_coords_perturbed, _ = _sanitize_lon_lat(gps_coords_perturbed)
+    if gps_coords_target is not None and len(gps_coords_target) > 0:
+        gps_coords_target, _ = _sanitize_lon_lat(gps_coords_target)
+
     # Pipeline outputs arrays shaped [N, 2] as [latitude, longitude]
-    ax.scatter(
-        gps_coords_source[:, 1],
-        gps_coords_source[:, 0],
-        color='deepskyblue',
-        marker='o',
-        s=200,
-        alpha=0.95,
-        linewidths=0.5,
-        transform=ccrs.PlateCarree(),
-        label='Source Locations',
-        zorder=5,
-    )
+    if len(gps_coords_source) > 0:
+        ax.scatter(
+            gps_coords_source[:, 1],
+            gps_coords_source[:, 0],
+            color='deepskyblue',
+            marker='o',
+            s=200,
+            alpha=0.95,
+            linewidths=0.5,
+            transform=ccrs.PlateCarree(),
+            label='Source Locations',
+            zorder=5,
+        )
     if gps_coords_target is not None and len(gps_coords_target) > 0:
         ax.scatter(
             gps_coords_target[:, 1],
@@ -48,19 +91,20 @@ def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_per
             label='Target Locations',
             zorder=6,
         )
-    ax.scatter(
-        gps_coords_perturbed[:, 1],
-        gps_coords_perturbed[:, 0],
-        color='red',
-        marker='X',
-        s=100,
-        alpha=0.95,
-        edgecolors='white',
-        linewidths=0.8,
-        transform=ccrs.PlateCarree(),
-        label='Perturbed Predicted Locations',
-        zorder=7,
-    )
+    if len(gps_coords_perturbed) > 0:
+        ax.scatter(
+            gps_coords_perturbed[:, 1],
+            gps_coords_perturbed[:, 0],
+            color='red',
+            marker='X',
+            s=100,
+            alpha=0.95,
+            edgecolors='white',
+            linewidths=0.8,
+            transform=ccrs.PlateCarree(),
+            label='Perturbed Predicted Locations',
+            zorder=7,
+        )
 
     # Add gridlines
     gl = ax.gridlines(draw_labels=True, linewidth=0.45, color='white', alpha=0.25, linestyle='--')
@@ -128,10 +172,19 @@ def plot_gps_trajectories_on_map(
 
         source_traj = gps_traj_source[:, trajectory_index, :]  # [num_steps, 2]
         if show_paths:
-            ax.plot(source_traj[:, 1], source_traj[:, 0], color=c, linewidth=0.7, alpha=0.35, transform=ccrs.PlateCarree(), zorder=4)
+            _plot_valid_path(
+                ax,
+                source_traj,
+                color=c,
+                linewidth=0.7,
+                alpha=0.35,
+                transform=ccrs.PlateCarree(),
+                zorder=4,
+            )
+        source_traj_sanitized, source_valid = _sanitize_lon_lat(source_traj)
         ax.scatter(
-            source_traj[:, 1],
-            source_traj[:, 0],
+            source_traj_sanitized[:, 1],
+            source_traj_sanitized[:, 0],
             color=c,
             marker='o',
             s=point_size,
@@ -144,10 +197,20 @@ def plot_gps_trajectories_on_map(
 
         perturbed_traj = gps_traj_perturbed[:, trajectory_index, :]  # [num_steps, 2]
         if show_paths:
-            ax.plot(perturbed_traj[:, 1], perturbed_traj[:, 0], color=c, linewidth=0.7, alpha=0.35, linestyle='--', transform=ccrs.PlateCarree(), zorder=4)
+            _plot_valid_path(
+                ax,
+                perturbed_traj,
+                color=c,
+                linewidth=0.7,
+                alpha=0.35,
+                linestyle='--',
+                transform=ccrs.PlateCarree(),
+                zorder=4,
+            )
+        perturbed_traj_sanitized, perturbed_valid = _sanitize_lon_lat(perturbed_traj)
         ax.scatter(
-            perturbed_traj[:, 1],
-            perturbed_traj[:, 0],
+            perturbed_traj_sanitized[:, 1],
+            perturbed_traj_sanitized[:, 0],
             color=c,
             marker='x',
             s=point_size,
@@ -159,7 +222,10 @@ def plot_gps_trajectories_on_map(
         )
 
         if show_connectors:
+            valid_steps = source_valid & perturbed_valid
             for step_index in range(num_steps):
+                if not valid_steps[step_index]:
+                    continue
                 ax.plot(
                     [source_traj[step_index, 1], perturbed_traj[step_index, 1]],
                     [source_traj[step_index, 0], perturbed_traj[step_index, 0]],
@@ -188,11 +254,30 @@ def plot_gps_trajectories_on_map(
 
     if show_displacement:
         ax_disp = fig.add_subplot(1, 2, 2)
-        dlat = gps_traj_perturbed[:, :n_plot, 0] - gps_traj_source[:, :n_plot, 0]
-        dlon = gps_traj_perturbed[:, :n_plot, 1] - gps_traj_source[:, :n_plot, 1]
+        src = gps_traj_source[:, :n_plot, :].astype(np.float64)
+        per = gps_traj_perturbed[:, :n_plot, :].astype(np.float64)
+        valid = np.isfinite(src).all(axis=2) & np.isfinite(per).all(axis=2)
+        dlat = per[:, :, 0] - src[:, :, 0]
+        dlon = per[:, :, 1] - src[:, :, 1]
         displacement = np.sqrt(dlat ** 2 + dlon ** 2)
-        mean_disp = displacement.mean(axis=1)
-        std_disp = displacement.std(axis=1)
+        displacement[~valid] = np.nan
+        valid_counts = valid.sum(axis=1)
+        sum_disp = np.nansum(displacement, axis=1)
+        mean_disp = np.divide(
+            sum_disp,
+            valid_counts,
+            out=np.zeros_like(sum_disp, dtype=np.float64),
+            where=valid_counts > 0,
+        )
+        centered = displacement - mean_disp[:, None]
+        centered_sq = np.where(valid, centered ** 2, np.nan)
+        var_disp = np.divide(
+            np.nansum(centered_sq, axis=1),
+            valid_counts,
+            out=np.zeros_like(sum_disp, dtype=np.float64),
+            where=valid_counts > 0,
+        )
+        std_disp = np.sqrt(var_disp)
         steps = np.arange(num_steps)
         ax_disp.plot(steps, mean_disp, color='crimson', linewidth=1.8, label='Mean displacement')
         ax_disp.fill_between(steps, np.maximum(mean_disp - std_disp, 0), mean_disp + std_disp, color='crimson', alpha=0.2, label='±1 std')
