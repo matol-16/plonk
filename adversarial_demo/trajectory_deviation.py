@@ -49,7 +49,7 @@ def train_diffusion_perturbation(
     clean_num_steps=200,
     log_every=20,
     target_pure_noise = False,
-    reconstruction_loss_weight=0,
+    reconstruction_loss_weight=0.0,
     device="cuda",
 ):
     # Freeze PLONK denoiser and embedding model parameters (we only optimize delta)
@@ -284,6 +284,7 @@ def build_diffusion_hparam_grid(
     anchor_samples_list,
     clean_num_steps_list,
     eps_max_list=None,
+    reconstruction_loss_weight_list=None,
 ):
     """
     Build cartesian-product hyperparameter configurations for diffusion attack training.
@@ -294,17 +295,28 @@ def build_diffusion_hparam_grid(
       - anchor_samples
       - clean_num_steps
       - eps_max (optional; included when eps_max_list is provided)
+      - reconstruction_loss_weight (optional; included when reconstruction_loss_weight_list is provided)
     """
     if eps_max_list is None:
         eps_max_list = [None]
+    if reconstruction_loss_weight_list is None:
+        reconstruction_loss_weight_list = [None]
 
     grid = []
-    for lr, train_batch_size, anchor_samples, clean_num_steps, eps_max_value in product(
+    for (
+        lr,
+        train_batch_size,
+        anchor_samples,
+        clean_num_steps,
+        eps_max_value,
+        reconstruction_loss_weight_value,
+    ) in product(
         lrs,
         train_batch_sizes,
         anchor_samples_list,
         clean_num_steps_list,
         eps_max_list,
+        reconstruction_loss_weight_list,
     ):
         if lr is None or train_batch_size is None or anchor_samples is None or clean_num_steps is None:
             raise ValueError("lrs, train_batch_sizes, anchor_samples_list and clean_num_steps_list cannot contain None")
@@ -316,6 +328,8 @@ def build_diffusion_hparam_grid(
         }
         if eps_max_value is not None:
             config["eps_max"] = float(eps_max_value)
+        if reconstruction_loss_weight_value is not None:
+            config["reconstruction_loss_weight"] = float(reconstruction_loss_weight_value)
         grid.append(config)
     return grid
 
@@ -326,6 +340,77 @@ def _score_history(history, tail_k=25):
         return float("inf")
     k = min(int(tail_k), len(history))
     return float(np.mean(history[-k:]))
+
+
+def compute_mean_perturbation_effect_over_steps(gps_traj_source, gps_traj_perturbed):
+    """
+    Compute the perturbation-effect metric used in plotting utilities.
+
+    This reproduces the displacement computation in `plot_gps_trajectories_on_map`:
+      displacement(step, sample) = sqrt((dlat)^2 + (dlon)^2)
+    and returns the mean perturbation effect over all steps.
+    """
+    if isinstance(gps_traj_source, torch.Tensor):
+        gps_traj_source = gps_traj_source.detach().cpu().numpy()
+    if isinstance(gps_traj_perturbed, torch.Tensor):
+        gps_traj_perturbed = gps_traj_perturbed.detach().cpu().numpy()
+
+    src = np.asarray(gps_traj_source, dtype=np.float64)
+    per = np.asarray(gps_traj_perturbed, dtype=np.float64)
+
+    if src.ndim != 3 or src.shape[-1] != 2:
+        raise ValueError("gps_traj_source must have shape [num_steps, batch_size, 2]")
+    if per.ndim != 3 or per.shape[-1] != 2:
+        raise ValueError("gps_traj_perturbed must have shape [num_steps, batch_size, 2]")
+    if src.shape != per.shape:
+        raise ValueError("gps_traj_source and gps_traj_perturbed must have the same shape")
+
+    valid = np.isfinite(src).all(axis=2) & np.isfinite(per).all(axis=2)
+    dlat = per[:, :, 0] - src[:, :, 0]
+    dlon = per[:, :, 1] - src[:, :, 1]
+    displacement = np.sqrt(dlat ** 2 + dlon ** 2)
+    displacement[~valid] = np.nan
+
+    valid_counts = valid.sum(axis=1)
+    sum_disp = np.nansum(displacement, axis=1)
+    mean_disp = np.divide(
+        sum_disp,
+        valid_counts,
+        out=np.zeros_like(sum_disp, dtype=np.float64),
+        where=valid_counts > 0,
+    )
+
+    step_has_valid = valid_counts > 0
+    if not np.any(step_has_valid):
+        return 0.0
+    return float(np.mean(mean_disp[step_has_valid]))
+
+
+def compute_mean_final_prediction_distance(gps_coords_source, gps_coords_perturbed):
+    """
+    Compute mean distance between final source and perturbed GPS predictions.
+
+    Inputs are arrays shaped [batch_size, 2] with [lat, lon].
+    Distance is Euclidean in degree space, consistent with plotting displacement.
+    """
+    src = np.asarray(gps_coords_source, dtype=np.float64)
+    per = np.asarray(gps_coords_perturbed, dtype=np.float64)
+
+    if src.ndim != 2 or src.shape[-1] != 2:
+        raise ValueError("gps_coords_source must have shape [batch_size, 2]")
+    if per.ndim != 2 or per.shape[-1] != 2:
+        raise ValueError("gps_coords_perturbed must have shape [batch_size, 2]")
+    if src.shape != per.shape:
+        raise ValueError("gps_coords_source and gps_coords_perturbed must have the same shape")
+
+    valid = np.isfinite(src).all(axis=1) & np.isfinite(per).all(axis=1)
+    if not np.any(valid):
+        return 0.0
+
+    dlat = per[valid, 0] - src[valid, 0]
+    dlon = per[valid, 1] - src[valid, 1]
+    dist = np.sqrt(dlat ** 2 + dlon ** 2)
+    return float(np.mean(dist))
 
 
 def run_diffusion_hparam_search(
@@ -341,6 +426,12 @@ def run_diffusion_hparam_search(
     score_tail_k=25,
     keep_deltas=False,
     show_progress=True,
+    num_restarts=1,
+    eval_batch_size=256,
+    eval_cfg=10.0,
+    eval_num_steps=None,
+    eval_seed=1234,
+    eval_metric="mean_perturbation_effect_over_steps",
 ):
     """
     Run a hyperparameter search over `train_diffusion_perturbation`.
@@ -350,12 +441,18 @@ def run_diffusion_hparam_search(
         pipeline: PLONK pipeline.
         hparam_grid: iterable of dicts with keys
             {"lr", "train_batch_size", "anchor_samples", "clean_num_steps"}
-            and optionally "eps_max".
+            and optionally "eps_max" and "reconstruction_loss_weight".
         n_steps, eps_max, target_pure_noise, reconstruction_loss_weight, device, log_every:
             forwarded to train_diffusion_perturbation.
-        score_tail_k: score = mean of the last k training losses.
+        score_tail_k: score = mean of the last k training losses (kept for logging).
         keep_deltas: if True, each trial stores trained perturbation tensor.
         show_progress: tqdm over trials.
+        num_restarts: number of independent training runs per config.
+        eval_batch_size, eval_cfg, eval_num_steps, eval_seed:
+            parameters used to evaluate trajectory perturbation effect.
+        eval_metric: one of
+            - "mean_perturbation_effect_over_steps"
+            - "mean_final_prediction_distance"
 
     Returns:
         dict with keys:
@@ -363,15 +460,26 @@ def run_diffusion_hparam_search(
           - best_config
           - best_score
           - trials (list of per-trial dicts)
-            each trial has: config, score, final_loss, min_loss, history, (optional) delta
+                each trial has:
+                  config, score, metric_name, final_loss, min_loss, history,
+                  best_restart, restart_summaries, (optional) delta
     """
     trials = []
     best_index = None
-    best_score = float("inf")
+    best_score = -float("inf")
 
     iterator = enumerate(hparam_grid)
     if show_progress:
         iterator = tqdm.tqdm(iterator, total=len(hparam_grid), desc="Hyperparameter search")
+
+    valid_metrics = {
+        "mean_perturbation_effect_over_steps",
+        "mean_final_prediction_distance",
+    }
+    if eval_metric not in valid_metrics:
+        raise ValueError(
+            f"Unknown eval_metric: {eval_metric}. Expected one of {sorted(valid_metrics)}"
+        )
 
     for trial_index, config in iterator:
         required = {"lr", "train_batch_size", "anchor_samples", "clean_num_steps"}
@@ -380,23 +488,104 @@ def run_diffusion_hparam_search(
             raise ValueError(f"Missing keys in config {trial_index}: {sorted(missing)}")
 
         trial_eps_max = float(config["eps_max"]) if "eps_max" in config else float(eps_max)
-
-        delta, history, _ = train_diffusion_perturbation(
-            source_image=source_image,
-            pipeline=pipeline,
-            n_steps=n_steps,
-            train_batch_size=int(config["train_batch_size"]),
-            lr=float(config["lr"]),
-            eps_max=trial_eps_max,
-            anchor_samples=int(config["anchor_samples"]),
-            clean_num_steps=int(config["clean_num_steps"]),
-            log_every=log_every,
-            target_pure_noise=target_pure_noise,
-            reconstruction_loss_weight=reconstruction_loss_weight,
-            device=device,
+        trial_reconstruction_loss_weight = (
+            float(config["reconstruction_loss_weight"])
+            if "reconstruction_loss_weight" in config
+            else float(reconstruction_loss_weight)
         )
 
-        score = _score_history(history, tail_k=score_tail_k)
+        restart_summaries = []
+        best_restart_effect = -float("inf")
+        best_restart_idx = None
+        best_restart_payload = None
+
+        for restart_idx in range(int(num_restarts)):
+            delta, history, _ = train_diffusion_perturbation(
+                source_image=source_image,
+                pipeline=pipeline,
+                n_steps=n_steps,
+                train_batch_size=int(config["train_batch_size"]),
+                lr=float(config["lr"]),
+                eps_max=trial_eps_max,
+                anchor_samples=int(config["anchor_samples"]),
+                clean_num_steps=int(config["clean_num_steps"]),
+                log_every=log_every,
+                target_pure_noise=target_pure_noise,
+                reconstruction_loss_weight=trial_reconstruction_loss_weight,
+                device=device,
+            )
+
+            # Build a perturbed image and evaluate perturbation effect on trajectories.
+            from adversarial_utils import add_perturbation_to_image
+
+            perturbed_image = add_perturbation_to_image(source_image, delta, pipeline)
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(eval_seed) + trial_index * 1000 + restart_idx)
+            x_N = torch.randn(eval_batch_size, 3, device=device, generator=gen)
+
+            if eval_num_steps is None:
+                gps_source_eval, traj_source = pipeline(
+                    source_image,
+                    batch_size=eval_batch_size,
+                    cfg=eval_cfg,
+                    x_N=x_N.clone(),
+                    return_trajectories=True,
+                )
+                gps_perturbed_eval, traj_perturbed = pipeline(
+                    perturbed_image,
+                    batch_size=eval_batch_size,
+                    cfg=eval_cfg,
+                    x_N=x_N.clone(),
+                    return_trajectories=True,
+                )
+            else:
+                gps_source_eval, traj_source = pipeline(
+                    source_image,
+                    batch_size=eval_batch_size,
+                    cfg=eval_cfg,
+                    x_N=x_N.clone(),
+                    num_steps=eval_num_steps,
+                    return_trajectories=True,
+                )
+                gps_perturbed_eval, traj_perturbed = pipeline(
+                    perturbed_image,
+                    batch_size=eval_batch_size,
+                    cfg=eval_cfg,
+                    x_N=x_N.clone(),
+                    num_steps=eval_num_steps,
+                    return_trajectories=True,
+                )
+
+            if eval_metric == "mean_perturbation_effect_over_steps":
+                effect_score = compute_mean_perturbation_effect_over_steps(traj_source, traj_perturbed)
+            else:
+                effect_score = compute_mean_final_prediction_distance(gps_source_eval, gps_perturbed_eval)
+            history_score = _score_history(history, tail_k=score_tail_k)
+            restart_summary = {
+                "restart": restart_idx,
+                "effect_score": effect_score,
+                "history_score": history_score,
+                "final_loss": float(history[-1]) if len(history) > 0 else float("inf"),
+                "min_loss": float(np.min(history)) if len(history) > 0 else float("inf"),
+            }
+            restart_summaries.append(restart_summary)
+
+            if effect_score > best_restart_effect:
+                best_restart_effect = effect_score
+                best_restart_idx = restart_idx
+                best_restart_payload = {
+                    "delta": delta,
+                    "history": history,
+                    "history_score": history_score,
+                }
+
+        if best_restart_payload is None:
+            raise RuntimeError("No restart completed successfully for this hyperparameter config")
+        if best_restart_idx is None:
+            raise RuntimeError("Unable to select best restart for this hyperparameter config")
+
+        score = float(best_restart_effect)
+        history = best_restart_payload["history"]
         trial = {
             "config": {
                 "lr": float(config["lr"]),
@@ -405,18 +594,24 @@ def run_diffusion_hparam_search(
                 "clean_num_steps": int(config["clean_num_steps"]),
             },
             "score": score,
+            "metric_name": eval_metric,
+            "best_restart": best_restart_idx,
+            "restart_summaries": restart_summaries,
+            "history_score": float(best_restart_payload["history_score"]),
             "final_loss": float(history[-1]) if len(history) > 0 else float("inf"),
             "min_loss": float(np.min(history)) if len(history) > 0 else float("inf"),
             "history": history,
         }
         if "eps_max" in config:
             trial["config"]["eps_max"] = trial_eps_max
+        if "reconstruction_loss_weight" in config:
+            trial["config"]["reconstruction_loss_weight"] = trial_reconstruction_loss_weight
         if keep_deltas:
-            trial["delta"] = delta
+            trial["delta"] = best_restart_payload["delta"]
 
         trials.append(trial)
 
-        if score < best_score:
+        if score > best_score:
             best_score = score
             best_index = trial_index
 
