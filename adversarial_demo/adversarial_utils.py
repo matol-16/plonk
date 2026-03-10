@@ -131,22 +131,40 @@ def plot_gps_trajectories_on_map(
     perturb_budget=None,
     cfg=None,
     max_trajectories=16,
+    show_map=True,
     show_paths=True,
     show_connectors=True,
     show_displacement=True,
     point_size=8,
 ):
-    fig = plt.figure(figsize=(12, 5) if show_displacement else (8, 6))
-    ax = fig.add_subplot(1, 2, 1, projection=ccrs.PlateCarree()) if show_displacement else fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
-    ax.set_global()
-    ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
+    if not show_map and not show_displacement:
+        raise ValueError("At least one of show_map or show_displacement must be True")
 
-    # Higher-contrast map colors for better point visibility
-    ax.set_facecolor('#1f2a38')
-    ax.add_feature(cfeature.OCEAN, facecolor='#1f2a38')
-    ax.add_feature(cfeature.LAND, facecolor='#d9d2b6', edgecolor='none')
-    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=0.7)
-    ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='white', linewidth=0.6)
+    map_ax = None
+    disp_ax = None
+
+    if show_map and show_displacement:
+        fig = plt.figure(figsize=(12, 5))
+        map_ax = fig.add_subplot(1, 2, 1, projection=ccrs.PlateCarree())
+        disp_ax = fig.add_subplot(1, 2, 2)
+    elif show_map:
+        fig = plt.figure(figsize=(8, 6))
+        map_ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    else:
+        fig = plt.figure(figsize=(7, 5))
+        disp_ax = fig.add_subplot(1, 1, 1)
+
+    if show_map:
+        assert map_ax is not None
+        map_ax.set_global()
+        map_ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
+
+        # Higher-contrast map colors for better point visibility
+        map_ax.set_facecolor('#1f2a38')
+        map_ax.add_feature(cfeature.OCEAN, facecolor='#1f2a38')
+        map_ax.add_feature(cfeature.LAND, facecolor='#d9d2b6', edgecolor='none')
+        map_ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=0.7)
+        map_ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='white', linewidth=0.6)
 
     if isinstance(gps_traj_source, torch.Tensor):
         gps_traj_source = gps_traj_source.detach().cpu().numpy()
@@ -171,89 +189,92 @@ def plot_gps_trajectories_on_map(
         c = colors[trajectory_index % len(colors)]
 
         source_traj = gps_traj_source[:, trajectory_index, :]  # [num_steps, 2]
-        if show_paths:
-            _plot_valid_path(
-                ax,
-                source_traj,
-                color=c,
-                linewidth=0.7,
-                alpha=0.35,
-                transform=ccrs.PlateCarree(),
-                zorder=4,
-            )
-        source_traj_sanitized, source_valid = _sanitize_lon_lat(source_traj)
-        ax.scatter(
-            source_traj_sanitized[:, 1],
-            source_traj_sanitized[:, 0],
-            color=c,
-            marker='o',
-            s=point_size,
-            alpha=0.85,
-            linewidths=0,
-            transform=ccrs.PlateCarree(),
-            zorder=5,
-            label='Source trajectories' if trajectory_index == 0 else None,
-        )
-
         perturbed_traj = gps_traj_perturbed[:, trajectory_index, :]  # [num_steps, 2]
-        if show_paths:
-            _plot_valid_path(
-                ax,
-                perturbed_traj,
-                color=c,
-                linewidth=0.7,
-                alpha=0.35,
-                linestyle='--',
-                transform=ccrs.PlateCarree(),
-                zorder=4,
-            )
-        perturbed_traj_sanitized, perturbed_valid = _sanitize_lon_lat(perturbed_traj)
-        ax.scatter(
-            perturbed_traj_sanitized[:, 1],
-            perturbed_traj_sanitized[:, 0],
-            color=c,
-            marker='x',
-            s=point_size,
-            alpha=0.85,
-            linewidths=0.8,
-            transform=ccrs.PlateCarree(),
-            zorder=6,
-            label='Perturbed trajectories' if trajectory_index == 0 else None,
-        )
 
-        if show_connectors:
-            valid_steps = source_valid & perturbed_valid
-            for step_index in range(num_steps):
-                if not valid_steps[step_index]:
-                    continue
-                ax.plot(
-                    [source_traj[step_index, 1], perturbed_traj[step_index, 1]],
-                    [source_traj[step_index, 0], perturbed_traj[step_index, 0]],
+        if show_map:
+            if show_paths:
+                _plot_valid_path(
+                    map_ax,
+                    source_traj,
                     color=c,
-                    linewidth=0.4,
-                    alpha=0.2,
+                    linewidth=0.7,
+                    alpha=0.35,
                     transform=ccrs.PlateCarree(),
-                    zorder=3,
+                    zorder=4,
                 )
+            source_traj_sanitized, source_valid = _sanitize_lon_lat(source_traj)
+            map_ax.scatter(
+                source_traj_sanitized[:, 1],
+                source_traj_sanitized[:, 0],
+                color=c,
+                marker='o',
+                s=point_size,
+                alpha=0.85,
+                linewidths=0,
+                transform=ccrs.PlateCarree(),
+                zorder=5,
+                label='Source trajectories' if trajectory_index == 0 else None,
+            )
 
-    # Add gridlines
-    gl = ax.gridlines(draw_labels=True, linewidth=0.45, color='white', alpha=0.25, linestyle='--')
-    gl.top_labels = False
-    gl.right_labels = False
+            if show_paths:
+                _plot_valid_path(
+                    map_ax,
+                    perturbed_traj,
+                    color=c,
+                    linewidth=0.7,
+                    alpha=0.35,
+                    linestyle='--',
+                    transform=ccrs.PlateCarree(),
+                    zorder=4,
+                )
+            perturbed_traj_sanitized, perturbed_valid = _sanitize_lon_lat(perturbed_traj)
+            map_ax.scatter(
+                perturbed_traj_sanitized[:, 1],
+                perturbed_traj_sanitized[:, 0],
+                color=c,
+                marker='x',
+                s=point_size,
+                alpha=0.85,
+                linewidths=0.8,
+                transform=ccrs.PlateCarree(),
+                zorder=6,
+                label='Perturbed trajectories' if trajectory_index == 0 else None,
+            )
 
-    # Add title and legend
-    title = 'Geolocation Trajectories (Global View)' if perturb_budget is None else f'Geolocation Trajectories (Budget: {perturb_budget:.3f})'
-    
-    if cfg is not None:
-        title += f", CFG: {cfg}"
-    if n_plot < batch_size:
-        title += f" (showing {n_plot}/{batch_size})"
-    
-    ax.set_title(title, fontsize=13, color='black', pad=12)
-    ax.legend(loc='upper left', fontsize='small', frameon=True, facecolor='white', edgecolor='black')
+            if show_connectors:
+                valid_steps = source_valid & perturbed_valid
+                for step_index in range(num_steps):
+                    if not valid_steps[step_index]:
+                        continue
+                    map_ax.plot(
+                        [source_traj[step_index, 1], perturbed_traj[step_index, 1]],
+                        [source_traj[step_index, 0], perturbed_traj[step_index, 0]],
+                        color=c,
+                        linewidth=0.4,
+                        alpha=0.2,
+                        transform=ccrs.PlateCarree(),
+                        zorder=3,
+                    )
+
+    if show_map:
+        # Add gridlines
+        gl = map_ax.gridlines(draw_labels=True, linewidth=0.45, color='white', alpha=0.25, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+
+        # Add title and legend
+        title = 'Geolocation Trajectories (Global View)' if perturb_budget is None else f'Geolocation Trajectories (Budget: {perturb_budget:.3f})'
+
+        if cfg is not None:
+            title += f", CFG: {cfg}"
+        if n_plot < batch_size:
+            title += f" (showing {n_plot}/{batch_size})"
+
+        map_ax.set_title(title, fontsize=13, color='black', pad=12)
+        map_ax.legend(loc='upper left', fontsize='small', frameon=True, facecolor='white', edgecolor='black')
 
     if show_displacement:
-        ax_disp = fig.add_subplot(1, 2, 2)
+        assert disp_ax is not None
         src = gps_traj_source[:, :n_plot, :].astype(np.float64)
         per = gps_traj_perturbed[:, :n_plot, :].astype(np.float64)
         valid = np.isfinite(src).all(axis=2) & np.isfinite(per).all(axis=2)
@@ -279,13 +300,13 @@ def plot_gps_trajectories_on_map(
         )
         std_disp = np.sqrt(var_disp)
         steps = np.arange(num_steps)
-        ax_disp.plot(steps, mean_disp, color='crimson', linewidth=1.8, label='Mean displacement')
-        ax_disp.fill_between(steps, np.maximum(mean_disp - std_disp, 0), mean_disp + std_disp, color='crimson', alpha=0.2, label='±1 std')
-        ax_disp.set_title('Perturbation effect over steps', fontsize=12)
-        ax_disp.set_xlabel('Step')
-        ax_disp.set_ylabel('Displacement (deg)')
-        ax_disp.grid(alpha=0.3)
-        ax_disp.legend(fontsize='small')
+        disp_ax.plot(steps, mean_disp, color='crimson', linewidth=1.8, label='Mean displacement')
+        disp_ax.fill_between(steps, np.maximum(mean_disp - std_disp, 0), mean_disp + std_disp, color='crimson', alpha=0.2, label='±1 std')
+        disp_ax.set_title('Perturbation effect over steps', fontsize=12)
+        disp_ax.set_xlabel('Step')
+        disp_ax.set_ylabel('Displacement (deg)')
+        disp_ax.grid(alpha=0.3)
+        disp_ax.legend(fontsize='small')
 
     fig.tight_layout()
     plt.show()

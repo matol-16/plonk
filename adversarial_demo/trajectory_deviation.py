@@ -50,6 +50,13 @@ def train_diffusion_perturbation(
     log_every=20,
     target_pure_noise = False,
     reconstruction_loss_weight=0.0,
+    num_restarts=1,
+    restart_selection_metric="mean_displacement",
+    restart_eval_batch_size=256,
+    restart_eval_cfg=10.0,
+    restart_eval_num_steps=None,
+    restart_eval_seed=1234,
+    print_restart_results=True,
     device="cuda",
 ):
     # Freeze PLONK denoiser and embedding model parameters (we only optimize delta)
@@ -63,12 +70,6 @@ def train_diffusion_perturbation(
         .to(device)
     )  # [1, 3, H, W]
 
-    # Universal perturbation parameter
-    delta = torch.zeros_like(source_tensor, requires_grad=True)
-    # optimizer = torch.optim.Adam([delta], lr=lr)
-    #we use sign sgd
-    optimizer = torch.optim.SGD([delta], lr=lr)
-
     # Approximate x0 distribution for this source image
     x0_bank = build_x0_bank_from_clean_model(
         pipeline,
@@ -78,77 +79,190 @@ def train_diffusion_perturbation(
         cfg=0.0,
     )  # [N, 3]
 
-    history = []
-    pbar = tqdm.trange(n_steps, desc="PGD attack training")
-
-    for step in pbar:
-        optimizer.zero_grad(set_to_none=True)
-
-        # Sample x0 from bank, noise eps, and continuous t ~ U(0,1)
-        idx = torch.randint(0, x0_bank.shape[0], (train_batch_size,), device=device)
-        x0 = x0_bank[idx]
-        eps = torch.randn_like(x0)
-
-        t = torch.rand(train_batch_size, device=device)
-        gamma = pipeline.scheduler(t)  # [B]
-
-        x_t = (
-            torch.sqrt(gamma).unsqueeze(-1) * x0
-            + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
+    metric_aliases = {
+        "mean": "mean_displacement",
+        "final": "final_displacement",
+    }
+    if restart_selection_metric in metric_aliases:
+        restart_selection_metric = metric_aliases[restart_selection_metric]
+    valid_metrics = {"mean_displacement", "final_displacement"}
+    if restart_selection_metric not in valid_metrics:
+        raise ValueError(
+            f"Unknown restart_selection_metric: {restart_selection_metric}. "
+            f"Expected one of {sorted(valid_metrics)}"
         )
+    if int(num_restarts) < 1:
+        raise ValueError("num_restarts must be >= 1")
 
-        # Compute conditional embedding of perturbed source image
-        perturbed_source = source_tensor + delta
-        emb_single = pipeline.cond_preprocessing.emb_model(perturbed_source).squeeze(0)
-        emb = emb_single.unsqueeze(0).repeat(train_batch_size, 1)
-  
-        # Denoiser epsilon prediction, using PLONK expected batch keys
-        model_batch_perturbed = {
-            "y": x_t,
-            "emb": emb,
-            "gamma": gamma,
-        }
-        eps_pred_perturbed = pipeline.model(model_batch_perturbed)
+    # Utility metric for restart selection: mean displacement at the final step.
+    def _compute_final_step_displacement(gps_traj_source, gps_traj_perturbed):
+        if isinstance(gps_traj_source, torch.Tensor):
+            gps_traj_source = gps_traj_source.detach().cpu().numpy()
+        if isinstance(gps_traj_perturbed, torch.Tensor):
+            gps_traj_perturbed = gps_traj_perturbed.detach().cpu().numpy()
 
-        if not target_pure_noise:
-            #compute conditional embedding of unperturbed source image
-            emb_source = pipeline.cond_preprocessing.emb_model(source_tensor).squeeze(0)
-            emb_source = emb_source.unsqueeze(0).repeat(train_batch_size, 1)
+        src = np.asarray(gps_traj_source, dtype=np.float64)
+        per = np.asarray(gps_traj_perturbed, dtype=np.float64)
+        if src.ndim != 3 or src.shape[-1] != 2:
+            raise ValueError("gps_traj_source must have shape [num_steps, batch_size, 2]")
+        if per.ndim != 3 or per.shape[-1] != 2:
+            raise ValueError("gps_traj_perturbed must have shape [num_steps, batch_size, 2]")
+        if src.shape != per.shape:
+            raise ValueError("gps_traj_source and gps_traj_perturbed must have the same shape")
 
-            model_batch = {
+        src_last = src[-1]
+        per_last = per[-1]
+        valid_last = np.isfinite(src_last).all(axis=1) & np.isfinite(per_last).all(axis=1)
+        if not np.any(valid_last):
+            return 0.0
+
+        dlat = per_last[valid_last, 0] - src_last[valid_last, 0]
+        dlon = per_last[valid_last, 1] - src_last[valid_last, 1]
+        dist = np.sqrt(dlat ** 2 + dlon ** 2)
+        return float(np.mean(dist))
+
+    restart_summaries = []
+    best_score = -float("inf")
+    best_delta = None
+    best_history = None
+    best_restart = None
+
+    from adversarial_utils import add_perturbation_to_image
+
+    for restart_idx in range(int(num_restarts)):
+        # Universal perturbation parameter (fresh start at each restart)
+        delta = torch.zeros_like(source_tensor, requires_grad=True)
+        #we use sign sgd
+        optimizer = torch.optim.SGD([delta], lr=lr)
+
+        history = []
+        pbar = tqdm.trange(n_steps, desc=f"PGD attack training (restart {restart_idx + 1}/{int(num_restarts)})")
+
+        for step in pbar:
+            optimizer.zero_grad(set_to_none=True)
+
+            # Sample x0 from bank, noise eps, and continuous t ~ U(0,1)
+            idx = torch.randint(0, x0_bank.shape[0], (train_batch_size,), device=device)
+            x0 = x0_bank[idx]
+            eps = torch.randn_like(x0)
+
+            t = torch.rand(train_batch_size, device=device)
+            gamma = pipeline.scheduler(t)  # [B]
+
+            x_t = (
+                torch.sqrt(gamma).unsqueeze(-1) * x0
+                + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
+            )
+
+            # Compute conditional embedding of perturbed source image
+            perturbed_source = source_tensor + delta
+            emb_single = pipeline.cond_preprocessing.emb_model(perturbed_source).squeeze(0)
+            emb = emb_single.unsqueeze(0).repeat(train_batch_size, 1)
+
+            # Denoiser epsilon prediction, using PLONK expected batch keys
+            model_batch_perturbed = {
                 "y": x_t,
-                "emb": emb_source,
+                "emb": emb,
                 "gamma": gamma,
             }
-            eps_pred = pipeline.model(model_batch)
-            eps= eps_pred
+            eps_pred_perturbed = pipeline.model(model_batch_perturbed)
+
+            if not target_pure_noise:
+                #compute conditional embedding of unperturbed source image
+                emb_source = pipeline.cond_preprocessing.emb_model(source_tensor).squeeze(0)
+                emb_source = emb_source.unsqueeze(0).repeat(train_batch_size, 1)
+
+                model_batch = {
+                    "y": x_t,
+                    "emb": emb_source,
+                    "gamma": gamma,
+                }
+                eps_pred = pipeline.model(model_batch)
+                eps= eps_pred
 
 
-        # Orthogonality objective: minimize squared cosine similarity
-        cos = F.cosine_similarity(eps, eps_pred_perturbed, dim=-1)
-        loss = (cos**2).mean()
-        
-        if reconstruction_loss_weight > 0:
-            # Add image reconstruction loss to ensure perturbation does not degrade image quality too much
-            loss_x = torch.nn.functional.l1_loss(perturbed_source, source_tensor)
-            loss= loss + reconstruction_loss_weight*loss_x
+            # Orthogonality objective: minimize squared cosine similarity
+            cos = F.cosine_similarity(eps, eps_pred_perturbed, dim=-1)
+            loss = (cos**2).mean()
+
+            if reconstruction_loss_weight > 0:
+                # Add image reconstruction loss to ensure perturbation does not degrade image quality too much
+                loss_x = torch.nn.functional.l1_loss(perturbed_source, source_tensor)
+                loss= loss + reconstruction_loss_weight*loss_x
 
 
-        loss.backward()
-        
-        #perform sign sgd in the l inf ball of radius eps_max:
-        with torch.no_grad():
-            delta.grad = torch.sign(delta.grad)
-            optimizer.step()
-            delta.data = torch.clamp(delta.data, -eps_max, eps_max)
-            delta.grad.zero_()
-        
+            loss.backward()
 
-        history.append(loss.item())
-        if (step + 1) % log_every == 0:
-            pbar.set_postfix(loss=f"{loss.item():.6f}")
+            #perform sign sgd in the l inf ball of radius eps_max:
+            with torch.no_grad():
+                delta.grad = torch.sign(delta.grad)
+                optimizer.step()
+                delta.data = torch.clamp(delta.data, -eps_max, eps_max)
+                delta.grad.zero_()
 
-    return delta.detach(), history, source_tensor
+
+            history.append(loss.item())
+            if (step + 1) % log_every == 0:
+                pbar.set_postfix(loss=f"{loss.item():.6f}")
+
+        # Evaluate restart quality on trajectory displacement with a shared initial noise.
+        perturbed_image = add_perturbation_to_image(source_image, delta.detach(), pipeline)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(restart_eval_seed) + restart_idx)
+        x_N = torch.randn(int(restart_eval_batch_size), 3, device=device, generator=generator)
+
+        eval_kwargs = {
+            "batch_size": int(restart_eval_batch_size),
+            "cfg": float(restart_eval_cfg),
+            "x_N": x_N,
+            "return_trajectories": True,
+        }
+        if restart_eval_num_steps is not None:
+            eval_kwargs["num_steps"] = int(restart_eval_num_steps)
+
+        _, traj_source = pipeline(source_image, **eval_kwargs)
+        _, traj_perturbed = pipeline(perturbed_image, **eval_kwargs)
+
+        mean_displacement = compute_mean_perturbation_effect_over_steps(traj_source, traj_perturbed)
+        final_displacement = _compute_final_step_displacement(traj_source, traj_perturbed)
+        score = mean_displacement if restart_selection_metric == "mean_displacement" else final_displacement
+
+        summary = {
+            "restart": restart_idx,
+            "mean_displacement": float(mean_displacement),
+            "final_displacement": float(final_displacement),
+            "score": float(score),
+            "final_loss": float(history[-1]) if len(history) > 0 else float("inf"),
+            "min_loss": float(np.min(history)) if len(history) > 0 else float("inf"),
+        }
+        restart_summaries.append(summary)
+
+        if print_restart_results:
+            print(
+                f"[restart {restart_idx + 1}/{int(num_restarts)}] "
+                f"final_loss={summary['final_loss']:.6f}, "
+                f"min_loss={summary['min_loss']:.6f}, "
+                f"mean_disp={summary['mean_displacement']:.6f}, "
+                f"final_disp={summary['final_displacement']:.6f}, "
+                f"selection_score={summary['score']:.6f}"
+            )
+
+        if score > best_score:
+            best_score = float(score)
+            best_delta = delta.detach().clone()
+            best_history = list(history)
+            best_restart = restart_idx
+
+    if best_delta is None or best_history is None or best_restart is None:
+        raise RuntimeError("No restart produced a valid perturbation")
+
+    if print_restart_results and int(num_restarts) > 1:
+        print(
+            f"Selected restart {best_restart + 1}/{int(num_restarts)} using "
+            f"{restart_selection_metric} (score={best_score:.6f})"
+        )
+
+    return best_delta, best_history, source_tensor
 
 ###########################################################################################################
 
