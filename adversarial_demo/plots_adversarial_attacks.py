@@ -47,7 +47,7 @@ def _plot_valid_path(ax, lat_lon_traj, **plot_kwargs):
             start = None
 
 
-def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_perturbed, perturb_budget = None, cfg=None):
+def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_perturbed, perturb_budget = None, cfg=None, point_size=100):
     plt.figure(figsize=(8,6))
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.set_global()
@@ -85,7 +85,7 @@ def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_per
             gps_coords_target[:, 0],
             color='lime',
             marker='o',
-            s=200,
+            s=point_size,
             alpha=0.95,
             linewidths=0.5,
             transform=ccrs.PlateCarree(),
@@ -98,7 +98,7 @@ def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_per
             gps_coords_perturbed[:, 0],
             color='red',
             marker='X',
-            s=100,
+            s=point_size,
             alpha=0.95,
             edgecolors='white',
             linewidths=0.8,

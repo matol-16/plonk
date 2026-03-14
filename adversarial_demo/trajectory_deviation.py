@@ -264,7 +264,7 @@ def train_diffusion_perturbation(
             f"{restart_selection_metric} (score={best_score:.6f})"
         )
 
-    return best_delta, best_history, source_tensor
+    return best_delta, best_history, source_tensor, 
 
 
 ###########################################################################################################

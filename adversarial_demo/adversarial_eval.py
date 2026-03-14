@@ -1,5 +1,3 @@
-"""Evaluation utilities for adversarial attacks."""
-
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -8,6 +6,11 @@ import numpy as np
 import torch
 
 from plonk.metrics.utils import haversine
+
+from attacks import run_attack
+
+
+#################Auxiliary functions for computing displacement metrics between trajectories.
 
 def trajectory_displacement(gps_traj_source, gps_traj_perturbed, metric = "haversine") -> torch.Tensor:
     """
@@ -101,3 +104,120 @@ def evaluate_source_perturbation(
 		"mean_trajectory_displacement": mean_trajectory_displacement(traj_source, traj_perturbed),
 		"mean_final_prediction_distance": mean_final_prediction_distance(gps_source, gps_perturbed),
 	}
+
+
+####################### Methods to evaluate a an attack across a dataset of source and perturbed images.
+
+#We evaluate first on OSV-5M's test set. We may also evaluate on YFCC4k
+
+from huggingface_hub import hf_hub_download
+import os
+import csv
+import random
+import zipfile
+from PIL import Image
+
+
+def load_osv5m_test(local_dir="datasets/osv5m"):
+    #only download if the data is not already present
+    if os.path.exists(os.path.join(local_dir, "images", "test")) and \
+       any(os.path.isdir(os.path.join(local_dir, "images", "test", d)) for d in os.listdir(os.path.join(local_dir, "images", "test"))):
+        return
+    for i in range(5):
+        hf_hub_download(repo_id="osv5m/osv5m", filename=str(i).zfill(2)+'.zip', subfolder="images/test", repo_type='dataset', local_dir=local_dir)
+    hf_hub_download(repo_id="osv5m/osv5m", filename="README.md", repo_type='dataset', local_dir=local_dir)
+    hf_hub_download(repo_id="osv5m/osv5m", filename="test.csv", repo_type='dataset', local_dir=local_dir)
+    # extract zip files
+    img_dir = os.path.join(local_dir, "images", "test")
+    for f in os.listdir(img_dir):
+        if f.endswith(".zip"):
+            with zipfile.ZipFile(os.path.join(img_dir, f), 'r') as z:
+                z.extractall(img_dir)
+    return
+
+def retrieve_osv_images(n_images_to_eval: int = 100, use_real_gps: bool = False):
+    local_dir = "datasets/osv5m"
+	download_osv5m_test(local_dir=local_dir)  # download & extract if needed
+
+	# Load test metadata from CSV
+	csv_path = os.path.join(local_dir, "test.csv")
+	with open(csv_path, "r") as f:
+		reader = csv.DictReader(f)
+		rows = list(reader)
+
+	img_dir = os.path.join(local_dir, "images", "test")
+	subdirs = sorted(d for d in os.listdir(img_dir) if os.path.isdir(os.path.join(img_dir, d)))
+	# Build a lookup: image_id -> file path
+	id_to_path = {}
+	for sd in subdirs:
+		sd_path = os.path.join(img_dir, sd)
+		for fname in os.listdir(sd_path):
+			img_id = os.path.splitext(fname)[0]
+			id_to_path[img_id] = os.path.join(sd_path, fname)
+
+	# Keep only rows whose image exists on disk
+	rows = [r for r in rows if r["id"] in id_to_path]
+
+	# Sample n_images_to_eval random images
+	rng = random.Random(42)
+	samples = rng.sample(rows, min(n_images_to_eval, len(rows)))
+
+	source_images = [Image.open(id_to_path[s["id"]]) for s in samples]
+	if use_real_gps:
+		source_gps = [(float(s["latitude"]), float(s["longitude"])) for s in samples]
+	print(f"Loaded {len(source_images)} images from OSV-5M test set.")
+	return source_images, source_gps if use_real_gps else None
+  
+def evaluate_attack_on_dataset(
+    attack_type: str,
+    pipeline,
+    dataset_name,
+    use_real_gps: bool = False,
+    n_images_to_eval: int = 100,
+    **kwargs):
+	"""
+		Evaluate an attack on images from a test dataset.
+
+		Args:
+			attack_type: "encoder" or "diffusion".
+			pipeline: Plonk pipeline.
+			dataset_name: Name of the dataset to evaluate on. "osvm" or "YFCC". THis corresponds to corresponding
+				test datasets (YFCC4K for YFCC). 
+            use_real_gps: Whether use real gps coords from dataset as source trajectory, instead of the clean predicted one for evaluation.
+			**kwargs: forwarded to the corresponding attack function.
+	"""
+
+	if dataset_name == "osv":
+		source_images, source_gps = retrieve_osv_images(n_images_to_eval=n_images_to_eval, use_real_gps=use_real_gps)
+		
+	else:
+		raise ValueError(f"Unknown dataset_name={dataset_name}. Expected one of ['osv']")
+    
+    #run the attack on each image and collect results
+	results = []
+	for i, source_image in enumerate(source_images):
+    	print(f"Evaluating image {i+1}/{len(source_images)}")
+		attack_result = run_attack(
+			attack_type=attack_type,
+			source_image=source_image,
+			pipeline=pipeline,
+			**kwargs,
+		)
+		if use_real_gps:
+			attack_result["source_gps"] = source_gps[i]
+		results.append(attack_result)
+	
+	#compute summary metrics across the dataset: final loss, final displacement.
+ 
+	return
+ 
+  
+
+
+if __name__ == "__main__":
+	# download_osv5m_test()
+	evaluate_attack_on_dataset(
+		attack_type="diffusion",
+  		dataset_name="osv",
+		pipeline=None,  
+	)
