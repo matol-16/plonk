@@ -33,7 +33,7 @@ It is organized as follows ($\dagger$ specifies if the given code was coded with
 **Evaluation scripts**:
 - 2 notebooks to test our framework in the folder *demo_notebooks*:
     - *eval_notebook_attacks.ipynb* is a simple notebook that allows testing our adversarial framework on an image saved in plonk/.media
-    - *notebook_binary_test.ipynb* allows testing (and reproducing our figures) our framework for image GPS localization manipulation.
+    - *notebook_binary_test.ipynb $\dagger$** allows testing (and reproducing our figures) our framework for image GPS localization manipulation.
 - *scripts_eval.py* allows running several evaluations (attack final step displacement, link between attack success and localizability...). Evaluations can be very long (several tens of hours on an A5000 GPU whithout parallelization) because one needs to train every attack for multiple attack budgets on multiple images.
 
 
