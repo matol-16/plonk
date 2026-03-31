@@ -2,15 +2,23 @@ from adversarial_eval import evaluate_attack_on_dataset, evaluate_attack_transfe
 from pipe_trajectory import PlonkPipelineTrajectory
 from plots_adversarial_attacks import plot_results
 
+### Here, you can run the evaluations on the YFCC and OSV-5M datasets, for different attack budgets. 
+# You can also plot the results of the evaluations directly, and compare the localizability of the perturbed images for different attack budgets.
+
+#To evaluate an attack:
+# - uncomment the corresponding attack_budget lists (not the same for every dataset for computing costs /training time reasons)
+# - select train_args, and the corresponding pipeline for the dataset you want to evaluate on (YFCC or OSV-5M)
+# - run evaluate_attack_on_dataset, or plot_results directly.
+
+
 if __name__ == "__main__":
     # download_osv5m_test()
  
     device = "cuda"
  
-    attack_budgets = [1/255,2/255,5/255,10/255,20/255,30/255, 50/255]
-    # attack_budgets = [2/255,25/255]
-    
-    # attack_budgets = [1/255,2/255,5/255,10/255,15/255,20/255,25/255,30/255, 50/255]
+    attack_budgets = [1/255,2/255,5/255,10/255,20/255,30/255, 50/255] #attack budgets for YFCC evaluation
+    # attack_budgets = [2/255,20/255,50/255] #Attack budgets for localizability evaluation
+    # attack_budgets = [1/255,2/255,5/255,10/255,15/255,20/255,25/255,30/255, 50/255] #attack budgets for OSV evaluation
 
     
     train_args = [{"n_steps":60,
@@ -27,7 +35,7 @@ if __name__ == "__main__":
         "device": device} for _ in range(len(attack_budgets))]
     
     # pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_OSV_5M_diffusion").to(device)	
-    # pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_YFCC_diffusion").to(device)
+    pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_YFCC_diffusion").to(device)
 
     # evaluate_attack_on_dataset(
     # 	attack_types=["diffusion"],
@@ -54,16 +62,20 @@ if __name__ == "__main__":
         all_results=None,
         stored_metrics=["final_step_displacement"])
     
-
-    # evaluate_attack_transferability(
-    # 	source_image=source_image,
-    # 	pipeline=pipeline,
-    # 	dataset_name="yfcc",
-      # 	n_images_to_eval=100,
-    # 	attacks=["diffusion"],
-    # 	attack_budgets=attack_budgets,
-    # 	attack_kwargs=train_args,
-    # 	metric="final_step_displacement",
-    # 	results_dir="./results_2",
-    # 	plot_dir="./plots_2",
+    
+    #### Code to evaluate localizability
+    
+    # attack_budget = 20/255
+    # results_attack_budgets = [2/255, 20/255, 50/255]
+    # results_dir = "./results"
+    # all_datasets_results = {
+    #     ds: torch.load(os.path.join(results_dir, f"{ds}_results_localizability.pt"))
+    #     for ds in ["yfcc", "osv"]
+    # }
+    # plot_localizability_results(
+    #     attack_budgets=attack_budget,
+    #     plot_dir="./plots",
+    #     all_datasets_results=all_datasets_results,
+    #     results_attack_budgets=results_attack_budgets,
     # )
+ 

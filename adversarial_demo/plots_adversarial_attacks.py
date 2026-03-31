@@ -612,7 +612,7 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
     n_rows = len(dataset_names)
     n_cols = len(attacks)
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 4 * n_rows), sharey='row')
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows), sharey='row')
     axes = np.atleast_2d(axes)
 
     all_values = []
@@ -635,7 +635,7 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
         Patch(facecolor=colors[i], edgecolor=colors[i], alpha=0.5, label=f"{bucket_names[i]} localizability")
         for i in range(3)
     ]
-    fig.legend(handles=legend_handles, loc='upper center', ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.02))
+    fig.legend(handles=legend_handles, loc='upper center', ncol=3, frameon=False, bbox_to_anchor=(0.52, 1.04))
     # fig.suptitle(f"Attack strength vs localizability — budget = {selected_budget * 255:.0f}/255", y=1.05)
     fig.tight_layout()
 
